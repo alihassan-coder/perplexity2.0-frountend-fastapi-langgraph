@@ -1,0 +1,303 @@
+import asyncio
+import uuid
+from typing import TypedDict, Annotated, Optional, List, Dict, Any
+from langgraph.graph import StateGraph, START, END
+from langchain_tavily import TavilySearch
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.messages import HumanMessage, AIMessage
+from dotenv import load_dotenv
+import os
+import json
+import time
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+import uvicorn
+
+from langchain_groq import ChatGroq
+from langgraph.checkpoint.memory import MemorySaver
+
+load_dotenv()
+
+# Configuration
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
+
+# Initialize LLM
+llm = ChatGroq(
+    model="openai/gpt-oss-120b",
+    api_key=GROQ_API_KEY,
+    temperature=0.1
+)
+
+# Initialize search tool
+search_tool = TavilySearch(
+    api_key=TAVILY_API_KEY,
+    max_results=3
+)
+
+# State definition
+class AgentState(TypedDict):
+    question: str
+    session_id: str
+    needs_search: bool
+    search_results: Optional[List[Dict]]
+    answer: str
+    sources: List[str]
+    response_stream: List[str]
+
+# Global memory for sessions
+memory = MemorySaver()
+
+# Question classifier function
+def classify_question(state: AgentState) -> AgentState:
+    """Determine if question needs search or can be answered directly"""
+    question = state["question"].lower()
+    
+    # Simple questions that don't need search
+    simple_patterns = [
+        "what is", "what are", "define", "explain", "how to", "how do",
+        "what does", "meaning of", "difference between", "compare",
+        "calculate", "math", "formula", "equation"
+    ]
+    
+    # Questions that definitely need search
+    search_patterns = [
+        "current", "latest", "recent", "today", "now", "2024", "2025",
+        "news", "weather", "stock", "price", "rate", "live", "real-time",
+        "happening", "breaking", "update", "trending"
+    ]
+    
+    # Check for search patterns first
+    for pattern in search_patterns:
+        if pattern in question:
+            state["needs_search"] = True
+            return state
+    
+    # Check for simple patterns
+    for pattern in simple_patterns:
+        if pattern in question:
+            state["needs_search"] = False
+            return state
+    
+    # Default to search for ambiguous questions
+    state["needs_search"] = True
+    return state
+
+# Search function
+def search_information(state: AgentState) -> AgentState:
+    """Search for information using Tavily"""
+    try:
+        search_results = search_tool.invoke(state["question"])
+        state["search_results"] = search_results
+        state["sources"] = [result.get("url", "") for result in search_results]
+    except Exception as e:
+        state["search_results"] = []
+        state["sources"] = []
+    return state
+
+# Direct answer function
+def direct_answer(state: AgentState) -> AgentState:
+    """Generate direct answer without search"""
+    prompt = f"""Answer this question directly and concisely: {state['question']}
+    
+    Provide a clear, helpful answer. If you're not certain about something, say so."""
+    
+    try:
+        response = llm.invoke(prompt)
+        state["answer"] = response.content
+    except Exception as e:
+        state["answer"] = f"Sorry, I encountered an error: {str(e)}"
+    
+    return state
+
+# Search-enhanced answer function
+def search_enhanced_answer(state: AgentState) -> AgentState:
+    """Generate answer using search results"""
+    search_results = state.get("search_results", [])
+    
+    if not search_results:
+        return direct_answer(state)
+    
+    # Format search results
+    context = "\n\n".join([
+        f"Source: {result.get('title', 'Unknown')}\nContent: {result.get('content', '')}"
+        for result in search_results
+    ])
+    
+    prompt = f"""Based on the following search results, answer this question: {state['question']}
+
+Search Results:
+{context}
+
+Provide a comprehensive answer based on the search results. Include relevant details and cite sources when appropriate."""
+    
+    try:
+        response = llm.invoke(prompt)
+        state["answer"] = response.content
+    except Exception as e:
+        state["answer"] = f"Sorry, I encountered an error: {str(e)}"
+    
+    return state
+
+# Stream response function
+async def stream_response(state: AgentState) -> AgentState:
+    """Stream the response for real-time output"""
+    answer = state["answer"]
+    words = answer.split()
+    
+    state["response_stream"] = []
+    for i, word in enumerate(words):
+        state["response_stream"].append(word)
+        await asyncio.sleep(0.05)  # Small delay for streaming effect
+    
+    return state
+
+# Create the workflow graph
+def create_workflow():
+    workflow = StateGraph(AgentState)
+    
+    # Add nodes
+    workflow.add_node("classify", classify_question)
+    workflow.add_node("search", search_information)
+    workflow.add_node("direct_answer", direct_answer)
+    workflow.add_node("search_answer", search_enhanced_answer)
+    workflow.add_node("stream", stream_response)
+    
+    # Add edges
+    workflow.add_edge(START, "classify")
+    
+    # Conditional routing based on classification
+    workflow.add_conditional_edges(
+        "classify",
+        lambda state: "search" if state["needs_search"] else "direct_answer",
+        {
+            "search": "search",
+            "direct_answer": "direct_answer"
+        }
+    )
+    
+    workflow.add_edge("search", "search_answer")
+    workflow.add_edge("direct_answer", "stream")
+    workflow.add_edge("search_answer", "stream")
+    workflow.add_edge("stream", END)
+    
+    return workflow.compile(checkpointer=memory)
+
+# Initialize workflow
+workflow = create_workflow()
+
+# FastAPI app
+app = FastAPI(title="Perplexity AI Clone", version="1.0.0")
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Session storage
+sessions: Dict[str, Dict] = {}
+
+@app.post("/ask")
+async def ask_question(question: str):
+    """Main endpoint to ask questions"""
+    if not question.strip():
+        raise HTTPException(status_code=400, detail="Question cannot be empty")
+    
+    # Generate session ID
+    session_id = str(uuid.uuid4())
+    
+    # Initialize state
+    initial_state = {
+        "question": question,
+        "session_id": session_id,
+        "needs_search": False,
+        "search_results": None,
+        "answer": "",
+        "sources": [],
+        "response_stream": []
+    }
+    
+    # Store session
+    sessions[session_id] = {
+        "question": question,
+        "timestamp": time.time(),
+        "status": "processing"
+    }
+    
+    try:
+        # Run workflow
+        result = await workflow.ainvoke(initial_state, config={"configurable": {"thread_id": session_id}})
+        
+        # Update session
+        sessions[session_id].update({
+            "status": "completed",
+            "answer": result["answer"],
+            "sources": result["sources"],
+            "needs_search": result["needs_search"]
+        })
+        
+        return {
+            "session_id": session_id,
+            "question": question,
+            "answer": result["answer"],
+            "sources": result["sources"],
+            "needs_search": result["needs_search"],
+            "timestamp": time.time()
+        }
+        
+    except Exception as e:
+        sessions[session_id]["status"] = "error"
+        raise HTTPException(status_code=500, detail=f"Error processing question: {str(e)}")
+
+@app.get("/stream/{session_id}")
+async def stream_response(session_id: str):
+    """Stream response for a session"""
+    if session_id not in sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    session = sessions[session_id]
+    if session["status"] != "completed":
+        raise HTTPException(status_code=400, detail="Session not completed")
+    
+    answer = session["answer"]
+    
+    async def generate():
+        words = answer.split()
+        for word in words:
+            yield f"data: {json.dumps({'word': word, 'session_id': session_id})}\n\n"
+            await asyncio.sleep(0.05)
+        yield f"data: {json.dumps({'done': True, 'session_id': session_id})}\n\n"
+    
+    return StreamingResponse(generate(), media_type="text/plain")
+
+@app.get("/session/{session_id}")
+async def get_session(session_id: str):
+    """Get session details"""
+    if session_id not in sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    return sessions[session_id]
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return {"status": "healthy", "timestamp": time.time()}
+
+if __name__ == "__main__":
+    print("🚀 Starting Perplexity AI Clone...")
+    print("📝 Features:")
+    print("  - Smart question classification")
+    print("  - Fast direct answers for simple questions")
+    print("  - Search-enhanced answers for complex questions")
+    print("  - Streaming responses")
+    print("  - Session management with UUID")
+    print("  - Scalable FastAPI architecture")
+    print("\n🌐 Server starting at http://localhost:8000")
+    print("📚 API docs available at http://localhost:8000/docs")
+    
+    uvicorn.run(app, host="0.0.0.0", port=8000)

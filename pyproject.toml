@@ -1,0 +1,20 @@
+[project]
+name = "perplexity-2-0"
+version = "0.1.0"
+description = "Perplexity AI Clone with Smart Question Routing"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "beautifulsoup4>=4.14.2",
+    "langchain-community>=0.3.31",
+    "langchain-google-genai>=2.1.12",
+    "langchain-groq>=0.3.8",
+    "langchain-openai>=0.3.35",
+    "langchain-tavily>=0.2.12",
+    "langgraph>=0.6.10",
+    "python-dotenv>=1.1.1",
+    "tavily-python>=0.7.12",
+    "fastapi>=0.104.1",
+    "uvicorn[standard]>=0.24.0",
+    "pydantic>=2.5.0",
+]
