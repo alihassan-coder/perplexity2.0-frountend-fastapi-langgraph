@@ -8,6 +8,7 @@ from langchain_core.messages import ToolMessage
 import os
 from dotenv import load_dotenv
 import asyncio
+import json
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from uuid import uuid4
@@ -88,8 +89,8 @@ Make sure the content of the Sources section matches the URLs returned by tavily
 
     conversation_messages = [m for m in messages if not isinstance(m, SystemMessage)]
 
-    max_recent_messages = 8
-    summary_trigger_messages = 12
+    max_recent_messages = 6
+    summary_trigger_messages = 8
 
     if len(conversation_messages) > summary_trigger_messages:
         older_messages = conversation_messages[:-max_recent_messages]
@@ -167,8 +168,15 @@ async def tool_node(state: State):
 
     # Extract URLs from Tavily search results
     urls = []
-    if tool_name == "tavily_search" and isinstance(tool_result, list):
-        for result in tool_result:
+    if tool_name == "tavily_search":
+        # Handle both list and dict return types (Tavily sometimes returns a dict with 'results')
+        search_results = []
+        if isinstance(tool_result, list):
+            search_results = tool_result
+        elif isinstance(tool_result, dict) and "results" in tool_result:
+            search_results = tool_result["results"]
+        
+        for result in search_results:
             if isinstance(result, dict) and "url" in result:
                 content = result.get("content", "")
                 urls.append({
@@ -177,8 +185,25 @@ async def tool_node(state: State):
                     "content": content[:200] + "..." if len(content) > 200 else content
                 })
 
+    # Create a concise version of the tool output for the LLM history
+    if tool_name == "tavily_search":
+        # Format as simple text (TOON/Text format) to save tokens and be more readable for the LLM
+        lines = []
+        for i, item in enumerate(urls, 1):
+            lines.append(f"Source {i}:")
+            lines.append(f"Title: {item['title']}")
+            lines.append(f"URL: {item['url']}")
+            lines.append(f"Content: {item['content']}")
+            lines.append("---")
+        tool_content = "\n".join(lines)
+    else:
+        # Fallback for other tools
+        tool_content = str(tool_result)
+        if len(tool_content) > 2000:
+             tool_content = tool_content[:2000] + "... (truncated)"
+
     tool_message = ToolMessage(
-        content=str(tool_result),
+        content=tool_content,
         tool_call_id=tool_id,
         name=tool_name,
     )
